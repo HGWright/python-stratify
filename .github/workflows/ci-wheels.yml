@@ -22,6 +22,8 @@ on:
     tags:
       - "v*"
 
+  workflow_dispatch:
+
 jobs:
   build_bdist:
     name: "build ${{ matrix.os }} (${{ matrix.arch }}) wheels"
