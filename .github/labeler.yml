@@ -25,5 +25,3 @@
 'Type: Tech Debt':
   - '(debt|Debt)'
 
-'Type: Question':
-  - '(question|Question)'
