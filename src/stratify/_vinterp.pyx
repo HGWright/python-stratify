@@ -294,6 +294,7 @@ cdef class PyFuncInterpolator(Interpolator):
         with gil:
             self.interp_kernel(index, z_src, fz_src, level, fz_target)
 
+
 cdef class Extrapolator(object):
     cdef long kernel(self, int direction,
                      double[:] z_src, double[:, :] fz_src,
@@ -698,23 +699,8 @@ cdef class _Interpolation(object):
                                  'the interpolation axis.')
             z_src_indexer = [0] * z_src.ndim
             z_src_indexer[zp_axis] = slice(0, 2)
-            src_first_two = z_src[tuple(z_src_indexer)]
-            src_rising = src_first_two[0] <= src_first_two[1]
-
-            src_rise = bool(src_rising)
-
-            z_tgt_indexer = [0] * z_target.ndim
-            z_tgt_indexer[zp_axis] = slice(0, 2)
-            tgt_first_two = z_target[tuple(z_tgt_indexer)]
-            tgt_rising = tgt_first_two[0] <= tgt_first_two[1]
-
-            tgt_rise = bool(tgt_rising)
-
-            if src_rise != tgt_rise:
-                z_src = np.flip(z_src)
-                fz_src = np.flip(fz_src)
-
-        self.rising = tgt_rise
+            first_two = zsrc[tuple(z_src_indexer)]
+            rising = first_two[1] <= first_two[0]
 
         # Sometimes we want to add additional constraints on our interpolation
         # and extrapolation - for example, linear extrapolation requires there
