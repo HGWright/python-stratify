@@ -91,7 +91,7 @@ cdef long gridwise_interpolation(double[:] z_target, double[:] z_src,
     cdef unsigned int i_src, i_target, n_src, n_target, i, m
     cdef bint all_nans = True
     cdef double z_before, z_current, z_after, z_last
-    cdef int sign_after, sign_before, extrapolating
+    cdef int sign_after, sign_before, extrapolating, z_final
 
     n_src = z_src.shape[0]
     n_target = z_target.shape[0]
@@ -112,6 +112,8 @@ cdef long gridwise_interpolation(double[:] z_target, double[:] z_src,
 
     interpolation.prepare_column(z_target, z_src, fz_src, rising)
     extrapolation.prepare_column(z_target, z_src, fz_src, rising)
+    with gil:
+        z_src = np.asarray(z_src)
 
     z_before = -INFINITY if rising else INFINITY
 
@@ -122,7 +124,11 @@ cdef long gridwise_interpolation(double[:] z_target, double[:] z_src,
     # first window value (typically -inf, but may be +inf) and the first z_src.
     # This search window will be moved along until a crossing is detected, at
     # which point we will do an interpolation.
-    z_after = z_src[0] if aligned else z_src[-1]
+    with gil:
+        z_final = z_src.size - 1
+
+
+    z_after = z_src[0] if aligned else z_src[z_final]
 
     # We start in extrapolation mode. This will be turned off as soon as we
     # start increasing i_src.
@@ -148,7 +154,13 @@ cdef long gridwise_interpolation(double[:] z_target, double[:] z_src,
             i_src += 1
             if i_src < n_src:
                 extrapolating = 0
-                z_after = z_src[i_src] if aligned else z_src[-i_src - 1]
+                with gil:
+                    if aligned:
+                        z_after = z_src[i_src]
+                    else:
+                        dummy = z_src.size - (i_src + 1)
+                        z_after = z_src[dummy]
+                #z_after = z_src[i_src] if aligned else z_src[-i_src - 1]
                 if isnan(z_after):
                     with gil:
                         raise ValueError('The source coordinate may not contain NaN values.')
@@ -560,6 +572,7 @@ def _interpolate(z_target, z_src, fz_src, axis=-1,
     interp = _Interpolation(z_target, z_src, fz_src, axis=axis,
                             interpolation=interpolation,
                             extrapolation=extrapolation)
+
     if interp.z_target.ndim == 1:
         return interp.interpolate()
     else:
@@ -569,7 +582,7 @@ def _interpolate(z_target, z_src, fz_src, axis=-1,
 cdef class _Interpolation(object):
     """
     Where the magic happens for gridwise_interp. The work of this __init__ is
-    mostly for putting the input nd 
+    mostly for putting the input nd
 
    """
     cdef Interpolator interpolation
@@ -615,14 +628,9 @@ cdef class _Interpolation(object):
                         'of dimensions, got {} != {}.')
                 raise ValueError(emsg.format(z_target.ndim, z_src.ndim))
             # Ensure z_target and z_src have same shape over their
-            # non-interpolated axes i.e. we need to ignore the axis of
-            # interpolation when comparing the shapes of z_target and z_src.
-            # E.g a z_target.shape=(3, 4, 5) and z_src.shape=(3, 10, 5),
-            # interpolating over zp_axis=1 is fine as (3, :, 5) == (3, :, 5).
-            # However, a z_target.shape=(3, 4, 6) and z_src.shape=(3, 10, 5),
-            # interpolating over zp_axis=1 must fail as (3, :, 6) != (3, :, 5)
+            # non-interpolated axes.
             zts, zss = z_target.shape, z_src.shape
-            ztsp, zssp = zip(*[(str(j), str(k)) if i!=zp_axis else (':', ':')
+            ztsp, zssp = zip(*[(str(j), str(k)) if i != zp_axis else (':', ':')
                                for i, (j, k) in enumerate(zip(zts, zss))])
             if ztsp != zssp:
                 sep, emsg = ', ', ('z_target and z_src have different shapes, '
@@ -630,58 +638,29 @@ cdef class _Interpolation(object):
                 raise ValueError(emsg.format(sep.join(ztsp), sep.join(zssp)))
             z_target_size = zts[zp_axis]
 
-        # We are going to put the source coordinate into a 3d shape for convenience of
-        # Cython interface. Writing generic, fast, n-dimensional Cython code
-        # is not possible, but it is possible to always support a 3d array with
-        # the middle dimensions being from the axis argument.
+        # Set the original shape of fz_src
+        self.orig_shape = fz_src.shape
 
-        # Work out the shape of the left hand side of the 3d array.
+        # Ensure the reshaping is done correctly
         lh_dim_size = ([1] + list(np.cumprod(z_src.shape)))[zp_axis]
-
-        # The coordinate shape will therefore be (size of lhs, size of axis, the rest).
         new_shape = (lh_dim_size, z_src.shape[zp_axis], -1)
 
-        #: The levels to interpolate onto.
-        self.z_target = z_target
-        #: The shape of the input data (fz_src).
-        self.orig_shape = fz_src.shape
-        #: The fz_src axis over which to do the interpolation.
-        self.axis = axis
-
-        #: The source z coordinate data reshaped into 3d working shape form.
         self._zp_reshaped = z_src.reshape(new_shape)
-        #: The fz_src data reshaped into 4d working shape form. The left-most
-        #: dimension is the dimension broadcast dimension - these are the
-        #: values which are not dependent on z, and come from the fact that
-        #: fz_src may be higher dimensional than z_src.
         self._fp_reshaped = fz_src.reshape((-1, ) + self._zp_reshaped.shape)
 
-        # Figure out the normalised 4d shape of the working result array.
-        # This will be the same as _fp_reshaped, but the length of the
-        # interpolation axis will change.
         result_working_shape = list(self._fp_reshaped.shape)
-        # Update the axis to be of the size of the levels.
         result_working_shape[2] = z_target_size
-
-        #: The shape of result while the interpolation is being calculated.
         self._result_working_shape = tuple(result_working_shape)
 
-        # Figure out the nd shape of the result array.
-        # This will be the same as fz_src, but the length of the
-        # interpolation axis will change.
         result_shape = list(self.orig_shape)
-        # Update the axis to be of the size of the levels.
         result_shape[fp_axis] = z_target_size
-
-        #: The shape of the interpolated data.
         self.result_shape = tuple(result_shape)
 
-        # TODO:
+        # Ensure the rising and aligned flags are correctly set
         if z_src.shape[zp_axis] < 2:
             raise ValueError('The rising keyword must be defined when '
-                                'the size of the source array is <2 in '
-                                'the interpolation axis.')
-
+                            'the size of the source array is <2 in '
+                            'the interpolation axis.')
 
         z_src_indexer = [0] * z_src.ndim
         z_src_indexer[zp_axis] = slice(0, 2)
@@ -695,13 +674,10 @@ cdef class _Interpolation(object):
         tgt_rising = tgt_first_two[0] <= tgt_first_two[1]
         tgt_rise = bool(tgt_rising)
 
-
         self.rising = bool(tgt_rising)
         self.aligned = src_rise == tgt_rise
 
-        # Sometimes we want to add additional constraints on our interpolation
-        # and extrapolation - for example, linear extrapolation requires there
-        # to be two coordinates to interpolate from.
+        # Ensure the interpolation and extrapolation are correctly validated
         if hasattr(self.interpolation, 'validate_data'):
             self.interpolation.validate_data(self)
 
@@ -711,37 +687,61 @@ cdef class _Interpolation(object):
         self.interpolation = interpolation
         self.extrapolation = extrapolation
 
+        self.z_target = z_target
+
     def interpolate(self):
-        # Construct the output array for the interpolation to fill in.
         fz_target = np.empty(self._result_working_shape, dtype=np.float64)
 
         cdef unsigned int i, j, ni, nj
-
         ni = fz_target.shape[1]
         nj = fz_target.shape[3]
 
-        # Pull in our pre-formed z_target, z_src, and fz_src arrays.
         cdef double[:] z_target = self.z_target
         cdef double[:, :, :] z_src = self._zp_reshaped
         cdef double[:, :, :, :] fz_src = self._fp_reshaped
-
-        # Construct a memory view of the fz_target array.
         cdef double[:, :, :, :] fz_target_view = fz_target
 
         cdef int rising = self.rising
         cdef int aligned = self.aligned
 
-        # Release the GIL and do the for loop over the left-hand, and
-        # right-hand dimensions. The loop optimised for row-major data (C).
         with nogil:
             for j in range(nj):
                 for i in range(ni):
                     gridwise_interpolation(z_target, z_src[i, :, j], fz_src[:, i, :, j],
-                                           rising,
-                                           aligned,
-                                           self.interpolation,
-                                           self.extrapolation,
-                                           fz_target_view[:, i, :, j])
+                                        rising,
+                                        aligned,
+                                        self.interpolation,
+                                        self.extrapolation,
+                                        fz_target_view[:, i, :, j])
+        return fz_target.reshape(self.result_shape).astype(self._target_dtype)
+
+    def interpolate_z_target_nd(self):
+        fz_target = np.empty(self._result_working_shape, dtype=np.float64)
+
+        cdef unsigned int i, j, ni, nj
+        cdef int rising = self.rising
+        cdef int aligned = self.aligned
+
+        ni = fz_target.shape[1]
+        nj = fz_target.shape[3]
+
+        z_target_reshaped = self.z_target.reshape(self._result_working_shape[1:])
+        cdef double[:, :, :] z_target = z_target_reshaped
+
+        cdef double[:, :, :] z_src = self._zp_reshaped
+        cdef double[:, :, :, :] fz_src = self._fp_reshaped
+        cdef double[:, :, :, :] fz_target_view = fz_target
+
+        with nogil:
+            for j in range(nj):
+                for i in range(ni):
+                    gridwise_interpolation(z_target[i, :, j], z_src[i, :, j], fz_src[:, i, :, j],
+                                            rising,
+                                            aligned,
+                                            self.interpolation,
+                                            self.extrapolation,
+                                            fz_target_view[:, i, :, j])
+
         return fz_target.reshape(self.result_shape).astype(self._target_dtype)
 
     def interpolate_z_target_nd(self):
